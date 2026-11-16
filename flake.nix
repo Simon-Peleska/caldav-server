@@ -7,9 +7,18 @@
         f nixpkgs.legacyPackages.${system});
     in
     {
+      packages = forAll (pkgs: {
+        default = pkgs.buildGoModule {
+          pname = "caldav";
+          version = "1.0.0";
+          src = ./.;
+          vendorHash = null;
+        };
+      });
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = [ ];
+          packages = [ pkgs.go ];
         };
       });
     };
