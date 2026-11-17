@@ -1,9 +1,9 @@
-// A very small CalDAV server: one .ics file per event/todo on disk, no
-// database, standard library only.
+// A very small CalDAV server: calendars and their events/todos live in a local
+// Turso database (DATA_DIR/caldav.db).
 //
-// Layout on disk (and in the URL space):
+// URL space:
 //
-//	DATA_DIR/<user>/<calendar>/<object>.ics   ->  /<user>/<calendar>/<object>.ics
+//	/<user>/<calendar>/<object>.ics
 //
 // Authentication is not done here: put it behind a reverse proxy that does
 // basic auth and passes the name in X-Remote-User, and bind to loopback.
@@ -16,10 +16,13 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/xml"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -27,9 +30,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	_ "turso.tech/database/tursogo"
 )
 
 const (
@@ -42,9 +48,27 @@ const (
 
 var validName = regexp.MustCompile(`^[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*$`)
 
+const schema = `
+CREATE TABLE IF NOT EXISTS calendars (
+	user TEXT NOT NULL,
+	name TEXT NOT NULL,
+	ctag INTEGER NOT NULL,
+	PRIMARY KEY (user, name)
+);
+CREATE TABLE IF NOT EXISTS objects (
+	user     TEXT NOT NULL,
+	cal      TEXT NOT NULL,
+	name     TEXT NOT NULL,
+	etag     TEXT NOT NULL,
+	modified INTEGER NOT NULL,
+	data     BLOB NOT NULL,
+	PRIMARY KEY (user, cal, name)
+);`
+
 type server struct {
-	dir string
-	mu  sync.Mutex // serialises writes so If-Match checks are not racy
+	db    *sql.DB
+	mu    sync.Mutex // serialises writes so If-Match checks are not racy
+	homes sync.Map   // users whose default calendar is known to exist
 }
 
 func main() {
@@ -53,9 +77,13 @@ func main() {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		log.Fatal(err)
 	}
+	db, err := openDB(filepath.Join(dir, "caldav.db"))
+	if err != nil {
+		log.Fatalf("E-DB-OPEN opening database: %v", err)
+	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           &server{dir: dir},
+		Handler:           &server{db: db},
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -72,6 +100,29 @@ func env(k, def string) string {
 	return def
 }
 
+func openDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("turso", path)
+	if err != nil {
+		return nil, err
+	}
+	// Every pooled connection is a separately opened database handle, so keep
+	// them around instead of letting database/sql close and reopen them.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// storageError logs a database failure under a stable code and reports the
+// same code to the client.
+func storageError(w http.ResponseWriter, code string, err error) {
+	log.Printf("%s storage error: %v", code, err)
+	http.Error(w, code+" storage error", http.StatusInternalServerError)
+}
+
 // resource kinds, by path depth
 const (
 	kRoot = iota // /
@@ -84,7 +135,15 @@ type resource struct {
 	kind int
 	user string
 	segs []string
-	fs   string
+	ctag int64  // kCal, filled in by load/children
+	obj  object // kObj, filled in by load/children
+}
+
+type object struct {
+	etag     string
+	modified int64 // unix seconds
+	size     int64
+	data     []byte // only loaded when calendar-data is asked for
 }
 
 func (r resource) href() string {
@@ -95,7 +154,7 @@ func (r resource) href() string {
 	return (&url.URL{Path: p}).EscapedPath()
 }
 
-func (s *server) resolve(user string, segs []string) (resource, bool) {
+func resolve(user string, segs []string) (resource, bool) {
 	if len(segs) > 3 {
 		return resource{}, false
 	}
@@ -107,10 +166,7 @@ func (s *server) resolve(user string, segs []string) (resource, bool) {
 	if len(segs) == 3 && !strings.HasSuffix(segs[2], ".ics") {
 		return resource{}, false
 	}
-	return resource{
-		kind: len(segs), user: user, segs: segs,
-		fs: filepath.Join(append([]string{s.dir}, segs...)...),
-	}, true
+	return resource{kind: len(segs), user: user, segs: segs}, true
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,14 +180,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	res, ok := s.resolve(user, segs)
+	res, ok := resolve(user, segs)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(s.dir, user, "calendar"), 0o750); err != nil {
-		log.Print(err)
-		http.Error(w, "storage error", http.StatusInternalServerError)
+	if err := s.ensureDefaultCalendar(r.Context(), user); err != nil {
+		storageError(w, "E-DB-HOME", err)
 		return
 	}
 
@@ -153,10 +208,106 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		s.del(w, r, res)
 	case "MKCALENDAR", "MKCOL":
-		s.mkcal(w, res)
+		s.mkcal(w, r, res)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// ── storage ──────────────────────────────────────────────────────────────────
+
+// ensureDefaultCalendar runs on every request, so it remembers users whose
+// default calendar exists; del forgets them when that calendar is deleted.
+func (s *server) ensureDefaultCalendar(ctx context.Context, user string) error {
+	if _, ok := s.homes.Load(user); ok {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO calendars (user, name, ctag) VALUES (?, 'calendar', ?) ON CONFLICT DO NOTHING`,
+		user, time.Now().UnixNano())
+	if err == nil {
+		s.homes.Store(user, struct{}{})
+	}
+	return err
+}
+
+// load fills in a calendar's ctag or an object's metadata (and data, if
+// asked for) and reports whether the resource exists.
+func (s *server) load(ctx context.Context, res *resource, withData bool) (bool, error) {
+	var err error
+	switch res.kind {
+	case kRoot, kHome:
+		return true, nil
+	case kCal:
+		err = s.db.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE user = ? AND name = ?`,
+			res.user, res.segs[1]).Scan(&res.ctag)
+	case kObj:
+		err = s.db.QueryRowContext(ctx, `SELECT etag, modified, length(data), `+dataColumn(withData)+` FROM objects WHERE user = ? AND cal = ? AND name = ?`,
+			res.user, res.segs[1], res.segs[2]).Scan(&res.obj.etag, &res.obj.modified, &res.obj.size, &res.obj.data)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func dataColumn(withData bool) string {
+	if withData {
+		return "data"
+	}
+	return "NULL"
+}
+
+func (s *server) children(ctx context.Context, res resource, withData bool) ([]resource, error) {
+	switch res.kind {
+	case kRoot:
+		return []resource{{kind: kHome, user: res.user, segs: []string{res.user}}}, nil
+	case kHome:
+		rows, err := s.db.QueryContext(ctx, `SELECT name, ctag FROM calendars WHERE user = ? ORDER BY name`, res.user)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []resource
+		for rows.Next() {
+			c := resource{kind: kCal, user: res.user}
+			var name string
+			if err := rows.Scan(&name, &c.ctag); err != nil {
+				return nil, err
+			}
+			c.segs = []string{res.user, name}
+			out = append(out, c)
+		}
+		return out, rows.Err()
+	case kCal:
+		rows, err := s.db.QueryContext(ctx, `SELECT name, etag, modified, length(data), `+dataColumn(withData)+` FROM objects WHERE user = ? AND cal = ? ORDER BY name`,
+			res.user, res.segs[1])
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []resource
+		for rows.Next() {
+			o := resource{kind: kObj, user: res.user}
+			var name string
+			if err := rows.Scan(&name, &o.obj.etag, &o.obj.modified, &o.obj.size, &o.obj.data); err != nil {
+				return nil, err
+			}
+			o.segs = []string{res.user, res.segs[1], name}
+			out = append(out, o)
+		}
+		return out, rows.Err()
+	}
+	return nil, nil
+}
+
+// bumpCtag marks a calendar as changed. The ctag is a nanosecond timestamp so
+// a deleted and recreated calendar does not reuse an old value.
+func bumpCtag(ctx context.Context, tx *sql.Tx, user, cal string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE calendars SET ctag = max(ctag + 1, ?) WHERE user = ? AND name = ?`,
+		time.Now().UnixNano(), user, cal)
+	return err
 }
 
 // ── properties ───────────────────────────────────────────────────────────────
@@ -174,118 +325,89 @@ func esc(s string) string {
 
 func principal(user string) string { return "<d:href>/" + esc(user) + "/</d:href>" }
 
-// prop returns the XML for one property of a resource, or false if the
-// resource does not have it.
-func (res resource) prop(n xml.Name) (string, bool) {
-	var data []byte
-	var info os.FileInfo
-	if res.kind == kObj {
-		var err error
-		if data, err = os.ReadFile(res.fs); err != nil {
-			return "", false
-		}
-		info, _ = os.Stat(res.fs)
-	}
+// prop writes the value of one property of a loaded resource into b and
+// reports whether the resource has it; it writes nothing when it does not.
+func (res resource) prop(b *bytes.Buffer, n xml.Name) bool {
 	switch n {
 	case xml.Name{Space: nsD, Local: "resourcetype"}:
 		switch res.kind {
 		case kRoot:
-			return "<d:collection/>", true
+			b.WriteString("<d:collection/>")
 		case kHome:
-			return "<d:collection/><d:principal/>", true
+			b.WriteString("<d:collection/><d:principal/>")
 		case kCal:
-			return "<d:collection/><c:calendar/>", true
+			b.WriteString("<d:collection/><c:calendar/>")
 		}
-		return "", true
+		return true
 	case xml.Name{Space: nsD, Local: "displayname"}:
 		switch res.kind {
 		case kHome:
-			return esc(res.user), true
+			b.WriteString(esc(res.user))
+			return true
 		case kCal, kObj:
-			return esc(res.segs[len(res.segs)-1]), true
+			b.WriteString(esc(res.segs[len(res.segs)-1]))
+			return true
 		}
 	case xml.Name{Space: nsD, Local: "current-user-principal"},
 		xml.Name{Space: nsD, Local: "principal-URL"},
-		xml.Name{Space: nsD, Local: "owner"}:
-		return principal(res.user), true
-	case xml.Name{Space: nsC, Local: "calendar-home-set"}:
-		return principal(res.user), true
+		xml.Name{Space: nsD, Local: "owner"},
+		xml.Name{Space: nsC, Local: "calendar-home-set"}:
+		b.WriteString(principal(res.user))
+		return true
 	case xml.Name{Space: nsD, Local: "supported-report-set"}:
 		if res.kind == kCal {
-			return `<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>` +
-				`<d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report>`, true
+			b.WriteString(`<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>` +
+				`<d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report>`)
+			return true
 		}
 	case xml.Name{Space: nsC, Local: "supported-calendar-component-set"}:
 		if res.kind == kCal {
-			return `<c:comp name="VEVENT"/><c:comp name="VTODO"/><c:comp name="VJOURNAL"/>`, true
+			b.WriteString(`<c:comp name="VEVENT"/><c:comp name="VTODO"/><c:comp name="VJOURNAL"/>`)
+			return true
 		}
 	case xml.Name{Space: nsCS, Local: "getctag"}:
 		if res.kind == kCal {
-			return esc(res.ctag()), true
+			b.WriteString(strconv.FormatInt(res.ctag, 10))
+			return true
 		}
 	case xml.Name{Space: nsD, Local: "getetag"}:
 		if res.kind == kObj {
-			return esc(etagOf(data)), true
+			b.WriteString(esc(res.obj.etag))
+			return true
 		}
 	case xml.Name{Space: nsD, Local: "getcontenttype"}:
 		if res.kind == kObj {
-			return "text/calendar; charset=utf-8", true
+			b.WriteString("text/calendar; charset=utf-8")
+			return true
 		}
 	case xml.Name{Space: nsD, Local: "getcontentlength"}:
 		if res.kind == kObj {
-			return fmt.Sprint(len(data)), true
+			b.WriteString(strconv.FormatInt(res.obj.size, 10))
+			return true
 		}
 	case xml.Name{Space: nsD, Local: "getlastmodified"}:
 		if res.kind == kObj {
-			return info.ModTime().UTC().Format(http.TimeFormat), true
+			b.WriteString(time.Unix(res.obj.modified, 0).UTC().Format(http.TimeFormat))
+			return true
 		}
 	case xml.Name{Space: nsC, Local: "calendar-data"}:
 		if res.kind == kObj {
-			return esc(string(data)), true
+			_ = xml.EscapeText(b, res.obj.data)
+			return true
 		}
 	}
-	return "", false
+	return false
 }
 
-// ctag changes whenever anything in the calendar is added, changed or removed.
-func (res resource) ctag() string {
-	h := sha256.New()
-	entries, _ := os.ReadDir(res.fs)
-	for _, e := range entries {
-		if info, err := e.Info(); err == nil && strings.HasSuffix(e.Name(), ".ics") {
-			fmt.Fprintln(h, e.Name(), info.Size(), info.ModTime().UnixNano())
+var calendarData = xml.Name{Space: nsC, Local: "calendar-data"}
+
+func wantsData(names []xml.Name) bool {
+	for _, n := range names {
+		if n == calendarData {
+			return true
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)[:8])
-}
-
-func (res resource) children() []resource {
-	var out []resource
-	switch res.kind {
-	case kRoot:
-		out = append(out, resource{kind: kHome, user: res.user, segs: []string{res.user}, fs: filepath.Join(res.fs, res.user)})
-	case kHome, kCal:
-		entries, _ := os.ReadDir(res.fs)
-		for _, e := range entries {
-			if (res.kind == kHome && e.IsDir()) || (res.kind == kCal && !e.IsDir() && strings.HasSuffix(e.Name(), ".ics")) {
-				out = append(out, resource{
-					kind: res.kind + 1, user: res.user,
-					segs: append(append([]string{}, res.segs...), e.Name()),
-					fs:   filepath.Join(res.fs, e.Name()),
-				})
-			}
-		}
-	}
-	return out
-}
-
-func (res resource) exists() bool {
-	switch res.kind {
-	case kRoot, kHome:
-		return true
-	}
-	info, err := os.Stat(res.fs)
-	return err == nil && info.IsDir() == (res.kind == kCal)
+	return false
 }
 
 var defaultProps = []xml.Name{
@@ -310,30 +432,46 @@ func (p propList) names() []xml.Name {
 	return out
 }
 
-func writeResponse(b *strings.Builder, res resource, names []xml.Name) {
-	var ok, missing strings.Builder
+// writeResponse writes one <d:response>. Each property is written in place
+// and cut off again if the resource lacks it, so values (calendar data
+// especially) are copied only once.
+func writeResponse(b *bytes.Buffer, res resource, names []xml.Name) {
+	b.WriteString("<d:response><d:href>" + res.href() + "</d:href>")
+	propstat := b.Len()
+	b.WriteString("<d:propstat><d:prop>")
+	var missing []xml.Name
 	for _, n := range names {
-		if v, found := res.prop(n); found {
-			fmt.Fprintf(&ok, "<%s xmlns=%q>%s</%s>", n.Local, n.Space, v, n.Local)
+		mark := b.Len()
+		b.WriteString("<" + n.Local + ` xmlns="` + esc(n.Space) + `">`)
+		if res.prop(b, n) {
+			b.WriteString("</" + n.Local + ">")
 		} else {
-			fmt.Fprintf(&missing, "<%s xmlns=%q/>", n.Local, n.Space)
+			b.Truncate(mark)
+			missing = append(missing, n)
 		}
 	}
-	fmt.Fprintf(b, "<d:response><d:href>%s</d:href>", res.href())
-	if ok.Len() > 0 {
-		fmt.Fprintf(b, "<d:propstat><d:prop>%s</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>", ok.String())
+	if len(missing) == len(names) {
+		b.Truncate(propstat)
+	} else {
+		b.WriteString("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>")
 	}
-	if missing.Len() > 0 {
-		fmt.Fprintf(b, "<d:propstat><d:prop>%s</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>", missing.String())
+	if len(missing) > 0 {
+		b.WriteString("<d:propstat><d:prop>")
+		for _, n := range missing {
+			b.WriteString("<" + n.Local + ` xmlns="` + esc(n.Space) + `"/>`)
+		}
+		b.WriteString("</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>")
 	}
 	b.WriteString("</d:response>")
 }
 
-func writeMultistatus(w http.ResponseWriter, body string) {
+func writeMultistatus(w http.ResponseWriter, body []byte) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(http.StatusMultiStatus)
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>`+
-		`<d:multistatus xmlns:d="DAV:" xmlns:c="%s" xmlns:cs="%s">%s</d:multistatus>`, nsC, nsCS, body)
+	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>`+
+		`<d:multistatus xmlns:d="DAV:" xmlns:c="`+nsC+`" xmlns:cs="`+nsCS+`">`)
+	_, _ = w.Write(body)
+	_, _ = io.WriteString(w, `</d:multistatus>`)
 }
 
 func readXML(r *http.Request, v any) error {
@@ -358,26 +496,37 @@ func (s *server) propfind(w http.ResponseWriter, r *http.Request, res resource) 
 		http.Error(w, "bad xml", http.StatusBadRequest)
 		return
 	}
-	if !res.exists() {
-		http.NotFound(w, r)
-		return
-	}
 	names := req.Prop.names()
 	if len(names) == 0 {
 		names = defaultProps
 	}
-	var b strings.Builder
+	withData := wantsData(names)
+	found, err := s.load(r.Context(), &res, withData)
+	if err != nil {
+		storageError(w, "E-DB-PROPFIND-LOAD", err)
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	var b bytes.Buffer
 	writeResponse(&b, res, names)
 	if r.Header.Get("Depth") != "0" {
-		for _, c := range res.children() {
+		children, err := s.children(r.Context(), res, withData)
+		if err != nil {
+			storageError(w, "E-DB-PROPFIND-LIST", err)
+			return
+		}
+		for _, c := range children {
 			writeResponse(&b, c, names)
 		}
 	}
-	writeMultistatus(w, b.String())
+	writeMultistatus(w, b.Bytes())
 }
 
-// Properties are fixed (names are the directory names), so refuse changes
-// instead of pretending they were stored.
+// Properties are fixed (names come from the URL), so refuse changes instead
+// of pretending they were stored.
 func (s *server) proppatch(w http.ResponseWriter, r *http.Request, res resource) {
 	var req struct {
 		Set []struct {
@@ -394,11 +543,11 @@ func (s *server) proppatch(w http.ResponseWriter, r *http.Request, res resource)
 	var props strings.Builder
 	for _, g := range append(req.Set, req.Remove...) {
 		for _, n := range g.Prop.names() {
-			fmt.Fprintf(&props, "<%s xmlns=%q/>", n.Local, n.Space)
+			props.WriteString("<" + n.Local + ` xmlns="` + esc(n.Space) + `"/>`)
 		}
 	}
-	writeMultistatus(w, fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:prop>%s</d:prop>`+
-		`<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat></d:response>`, res.href(), props.String()))
+	writeMultistatus(w, []byte(`<d:response><d:href>`+res.href()+`</d:href><d:propstat><d:prop>`+props.String()+
+		`</d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat></d:response>`))
 }
 
 // report answers calendar-multiget and calendar-query. Filters in a query are
@@ -417,35 +566,59 @@ func (s *server) report(w http.ResponseWriter, r *http.Request, res resource) {
 	if len(names) == 0 {
 		names = []xml.Name{{Space: nsD, Local: "getetag"}}
 	}
-	var b strings.Builder
+	withData := wantsData(names)
+	var b bytes.Buffer
 	switch req.XMLName {
 	case xml.Name{Space: nsC, Local: "calendar-multiget"}:
+		// One point lookup per href: Turso does not use the primary key for
+		// "name IN (...)" and would scan the whole calendar instead.
 		for _, h := range req.Hrefs {
 			u, err := url.Parse(h)
 			if err != nil {
 				continue
 			}
 			segs := strings.FieldsFunc(u.Path, func(c rune) bool { return c == '/' })
-			o, ok := s.resolve(res.user, segs)
-			if !ok || o.kind != kObj || segs[0] != res.user || !o.exists() {
-				fmt.Fprintf(&b, "<d:response><d:href>%s</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>", esc(h))
+			o, ok := resolve(res.user, segs)
+			found := false
+			if ok && o.kind == kObj && segs[0] == res.user {
+				if found, err = s.load(r.Context(), &o, withData); err != nil {
+					storageError(w, "E-DB-MULTIGET", err)
+					return
+				}
+			}
+			if !found {
+				b.WriteString("<d:response><d:href>" + esc(h) + "</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>")
 				continue
 			}
 			writeResponse(&b, o, names)
 		}
 	case xml.Name{Space: nsC, Local: "calendar-query"}:
-		if res.kind != kCal || !res.exists() {
+		if res.kind != kCal {
 			http.NotFound(w, r)
 			return
 		}
-		for _, o := range res.children() {
+		found, err := s.load(r.Context(), &res, false)
+		if err != nil {
+			storageError(w, "E-DB-QUERY-LOAD", err)
+			return
+		}
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		children, err := s.children(r.Context(), res, withData)
+		if err != nil {
+			storageError(w, "E-DB-QUERY-LIST", err)
+			return
+		}
+		for _, o := range children {
 			writeResponse(&b, o, names)
 		}
 	default:
 		http.Error(w, "unsupported report", http.StatusForbidden)
 		return
 	}
-	writeMultistatus(w, b.String())
+	writeMultistatus(w, b.Bytes())
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request, res resource) {
@@ -453,21 +626,24 @@ func (s *server) get(w http.ResponseWriter, r *http.Request, res resource) {
 		http.Error(w, "not a calendar object", http.StatusMethodNotAllowed)
 		return
 	}
-	data, err := os.ReadFile(res.fs)
+	found, err := s.load(r.Context(), &res, true)
 	if err != nil {
+		storageError(w, "E-DB-GET", err)
+		return
+	}
+	if !found {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
-	w.Header().Set("ETag", etagOf(data))
-	_, _ = w.Write(data)
+	w.Header().Set("ETag", res.obj.etag)
+	_, _ = w.Write(res.obj.data)
 }
 
-// preconditionFailed checks If-Match / If-None-Match against the current file.
-func preconditionFailed(r *http.Request, res resource) bool {
-	data, err := os.ReadFile(res.fs)
-	exists := err == nil
-	if m := r.Header.Get("If-Match"); m != "" && m != "*" && (!exists || m != etagOf(data)) {
+// preconditionFailed checks If-Match / If-None-Match against the current
+// object, given whether it exists and its etag.
+func preconditionFailed(r *http.Request, exists bool, etag string) bool {
+	if m := r.Header.Get("If-Match"); m != "" && m != "*" && (!exists || m != etag) {
 		return true
 	} else if m == "*" && !exists {
 		return true
@@ -492,43 +668,58 @@ func (s *server) put(w http.ResponseWriter, r *http.Request, res resource) {
 		http.Error(w, "not an iCalendar object", http.StatusBadRequest)
 		return
 	}
+	ctx := r.Context()
+	user, cal, name := res.user, res.segs[1], res.segs[2]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	calDir := filepath.Dir(res.fs)
-	if info, err := os.Stat(calDir); err != nil || !info.IsDir() {
-		http.Error(w, "calendar does not exist", http.StatusConflict)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		storageError(w, "E-DB-PUT-BEGIN", err)
 		return
 	}
-	if preconditionFailed(r, res) {
+	defer tx.Rollback()
+
+	var ctag int64
+	err = tx.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE user = ? AND name = ?`, user, cal).Scan(&ctag)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "calendar does not exist", http.StatusConflict)
+		return
+	} else if err != nil {
+		storageError(w, "E-DB-PUT-CAL", err)
+		return
+	}
+	var current string
+	err = tx.QueryRowContext(ctx, `SELECT etag FROM objects WHERE user = ? AND cal = ? AND name = ?`, user, cal, name).Scan(&current)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		storageError(w, "E-DB-PUT-OBJ", err)
+		return
+	}
+	exists := err == nil
+	if preconditionFailed(r, exists, current) {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
-	_, statErr := os.Stat(res.fs)
-	created := statErr != nil
 
-	tmp, err := os.CreateTemp(calDir, ".tmp-*")
-	if err == nil {
-		_, err = tmp.Write(data)
-		if cerr := tmp.Close(); err == nil {
-			err = cerr
-		}
-		if err == nil {
-			err = os.Rename(tmp.Name(), res.fs)
-		}
-		if err != nil {
-			os.Remove(tmp.Name())
-		}
-	}
-	if err != nil {
-		log.Print(err)
-		http.Error(w, "storage error", http.StatusInternalServerError)
+	etag := etagOf(data)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO objects (user, cal, name, etag, modified, data) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (user, cal, name) DO UPDATE SET etag = excluded.etag, modified = excluded.modified, data = excluded.data`,
+		user, cal, name, etag, time.Now().Unix(), data); err != nil {
+		storageError(w, "E-DB-PUT-WRITE", err)
 		return
 	}
-	w.Header().Set("ETag", etagOf(data))
-	if created {
-		w.WriteHeader(http.StatusCreated)
-	} else {
+	if err := bumpCtag(ctx, tx, user, cal); err != nil {
+		storageError(w, "E-DB-PUT-CTAG", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		storageError(w, "E-DB-PUT-COMMIT", err)
+		return
+	}
+	w.Header().Set("ETag", etag)
+	if exists {
 		w.WriteHeader(http.StatusNoContent)
+	} else {
+		w.WriteHeader(http.StatusCreated)
 	}
 }
 
@@ -537,38 +728,73 @@ func (s *server) del(w http.ResponseWriter, r *http.Request, res resource) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	ctx := r.Context()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !res.exists() {
+	found, err := s.load(ctx, &res, false)
+	if err != nil {
+		storageError(w, "E-DB-DEL-LOAD", err)
+		return
+	}
+	if !found {
 		http.NotFound(w, r)
 		return
 	}
-	if res.kind == kObj && preconditionFailed(r, res) {
+	if res.kind == kObj && preconditionFailed(r, true, res.obj.etag) {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
-	if err := os.RemoveAll(res.fs); err != nil {
-		log.Print(err)
-		http.Error(w, "storage error", http.StatusInternalServerError)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		storageError(w, "E-DB-DEL-BEGIN", err)
 		return
+	}
+	defer tx.Rollback()
+	user, cal := res.user, res.segs[1]
+	if res.kind == kObj {
+		_, err = tx.ExecContext(ctx, `DELETE FROM objects WHERE user = ? AND cal = ? AND name = ?`, user, cal, res.segs[2])
+		if err == nil {
+			err = bumpCtag(ctx, tx, user, cal)
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `DELETE FROM objects WHERE user = ? AND cal = ?`, user, cal)
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `DELETE FROM calendars WHERE user = ? AND name = ?`, user, cal)
+		}
+	}
+	if err != nil {
+		storageError(w, "E-DB-DEL-WRITE", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		storageError(w, "E-DB-DEL-COMMIT", err)
+		return
+	}
+	if res.kind == kCal && cal == "calendar" {
+		s.homes.Delete(user)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *server) mkcal(w http.ResponseWriter, res resource) {
+func (s *server) mkcal(w http.ResponseWriter, r *http.Request, res resource) {
 	if res.kind != kCal {
 		http.Error(w, "calendars live at /<user>/<name>/", http.StatusForbidden)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.Mkdir(res.fs, 0o750); err != nil {
-		if os.IsExist(err) {
-			http.Error(w, "exists", http.StatusMethodNotAllowed)
-		} else {
-			log.Print(err)
-			http.Error(w, "storage error", http.StatusInternalServerError)
-		}
+	found, err := s.load(r.Context(), &res, false)
+	if err != nil {
+		storageError(w, "E-DB-MKCAL-LOAD", err)
+		return
+	}
+	if found {
+		http.Error(w, "exists", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `INSERT INTO calendars (user, name, ctag) VALUES (?, ?, ?)`,
+		res.user, res.segs[1], time.Now().UnixNano()); err != nil {
+		storageError(w, "E-DB-MKCAL-WRITE", err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
