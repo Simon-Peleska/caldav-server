@@ -175,6 +175,23 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	isUI := strings.HasPrefix(r.URL.Path, "/~/")
+	if err := s.ensureDefaultCalendar(r.Context(), user); err != nil {
+		if isUI {
+			uiError(w, http.StatusInternalServerError, "E-DB-HOME", err)
+		} else {
+			storageError(w, "E-DB-HOME", err)
+		}
+		return
+	}
+	if isUI {
+		s.ui(w, r, user)
+		return
+	}
+	if (r.URL.Path == "/" || r.URL.Path == "/~" || r.URL.Path == "/"+user+"/") && r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/html") {
+		http.Redirect(w, r, "/~/", http.StatusSeeOther)
+		return
+	}
 	segs := strings.FieldsFunc(r.URL.Path, func(c rune) bool { return c == '/' })
 	if len(segs) > 0 && segs[0] != user {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -183,10 +200,6 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	res, ok := resolve(user, segs)
 	if !ok {
 		http.NotFound(w, r)
-		return
-	}
-	if err := s.ensureDefaultCalendar(r.Context(), user); err != nil {
-		storageError(w, "E-DB-HOME", err)
 		return
 	}
 

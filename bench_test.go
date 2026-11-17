@@ -31,7 +31,8 @@ func BenchmarkHotPaths(b *testing.B) {
 	}
 	const events = 2000
 	for i := range events {
-		if code := call("PUT", fmt.Sprintf("/alice/calendar/%d.ics", i), event(fmt.Sprint(i))+strings.Repeat("X", 600)); code != http.StatusCreated {
+		ics := strings.Replace(event(fmt.Sprint(i)), "UID:", fmt.Sprintf("DTSTART;TZID=Europe/Berlin:2%03d0101T100000\r\nUID:", i%1000), 1)
+		if code := call("PUT", fmt.Sprintf("/alice/calendar/%d.ics", i), ics+strings.Repeat("X", 600)); code != http.StatusCreated {
 			b.Fatalf("put: %d", code)
 		}
 	}
@@ -57,6 +58,24 @@ func BenchmarkHotPaths(b *testing.B) {
 	b.Run("multiget-100", func(b *testing.B) {
 		for b.Loop() {
 			if code := call("REPORT", "/alice/calendar/", `<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop>`+hrefs.String()+`</c:calendar-multiget>`); code != http.StatusMultiStatus {
+				b.Fatalf("status %d", code)
+			}
+		}
+	})
+	b.Run("ui-page", func(b *testing.B) {
+		for b.Loop() {
+			if code := call("GET", "/~/", ""); code != http.StatusOK {
+				b.Fatalf("status %d", code)
+			}
+		}
+	})
+	b.Run("ui-poll-unchanged", func(b *testing.B) {
+		var ctag int64
+		if err := db.QueryRow(`SELECT ctag FROM calendars WHERE user = 'alice' AND name = 'calendar'`).Scan(&ctag); err != nil {
+			b.Fatal(err)
+		}
+		for b.Loop() {
+			if code := call("GET", fmt.Sprintf("/~/events?cal=calendar&ctag=%d", ctag), ""); code != http.StatusNoContent {
 				b.Fatalf("status %d", code)
 			}
 		}

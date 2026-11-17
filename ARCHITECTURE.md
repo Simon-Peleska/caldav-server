@@ -1,6 +1,18 @@
 # Architecture
 
-One Go file (`main.go`), one HTTP handler, one Turso database file.
+One HTTP handler, one Turso database file. `main.go` is the CalDAV server, `ui.go` the web UI.
+
+## Web UI
+
+Server-rendered `html/template` pages under `/~/` (`~` can't start a user name, so they never collide with CalDAV paths), made interactive with htmx 4, which is vendored and embedded (`htmx-4.0.1.min.js`). Same auth as CalDAV: the proxy's `X-Remote-User`.
+
+- Forms post with htmx; the handler writes the event (same transaction + `bumpCtag` as PUT) and returns the re-rendered `#events` section.
+- Live updates without websockets: `#events` polls every 10 s with the ctag it was rendered from. The server answers 204 (htmx doesn't swap) if the ctag is unchanged, so an idle tab costs one point lookup per 10 s.
+- Errors: `uiError` logs the code and returns it with `HX-Retarget: #error`, so htmx shows it in the error box whatever element made the request. Add and delete responses clear the box with an out-of-band swap; polls don't, so a background sync can't wipe an error the user is reading.
+- CSRF: basic-auth credentials ride along on cross-site requests, so every UI request goes through `http.CrossOriginProtection` (Sec-Fetch-Site / Origin).
+- Event display parses only SUMMARY / DTSTART / DTEND / DUE of the first VEVENT or VTODO. Times are shown as written in the event, with their TZID, since the server doesn't know the viewer's zone. Recurrences aren't expanded: a repeating event is listed once at its first date, marked "repeats", and never counted as past. `DURATION` is ignored (such events count as past once they start) and completed tasks are listed like open ones. Events added in the UI use floating local times (or all-day dates).
+- "Past" is decided at render time, and polls only re-render when the ctag changes, so an event that ends while the tab is open stays in the upcoming list until the next change or reload. Good enough for a simple UI.
+- Cost (`bench_test.go`, 2000 events): unchanged poll 0.014 ms; full page 17 ms, roughly half reading event rows from Turso, a quarter templating, a fifth ICS parsing. The UI write handlers release `server.mu` before re-rendering, so CalDAV writes don't wait on that.
 
 ## Storage
 
