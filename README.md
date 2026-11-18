@@ -8,5 +8,5 @@ A very small CalDAV server. Calendars and events live in a local [Turso](https:/
 - Data: `DATA_DIR/caldav.db` (plus its `-wal` file). A calendar named `calendar` is created per user.
 - The Turso driver extracts its native library into `$TURSO_GO_CACHE_DIR` (default: the user cache dir, e.g. `~/.cache/turso-go`). That directory must be writable — set `TURSO_GO_CACHE_DIR` for services without a home directory.
 - Auth: none built in. Run it on loopback behind a reverse proxy that does auth and sets `X-Remote-User`.
-- Web UI: open the server root in a browser (it redirects to `/~/`). Lists, adds and deletes events and calendars; the list refreshes within 10 s when a client changes the calendar.
+- Web UI: open the server root in a browser (it redirects to `/~/`). Lists, adds and deletes the events of the `calendar` calendar (other calendars are CalDAV-only); the list refreshes within 10 s when a client changes the calendar.
 - Not implemented: sync-collection, time-range filtering (all objects are returned), PROPPATCH (refused).

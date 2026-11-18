@@ -49,38 +49,28 @@ func (s *server) ui(w http.ResponseWriter, r *http.Request, user string) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
-	cal := r.FormValue("cal")
-	if cal == "" {
-		cal = "calendar"
-	}
-	if !validName.MatchString(cal) {
-		uiError(w, http.StatusBadRequest, "E-UI-BAD-CAL", fmt.Errorf("invalid calendar name %q", cal))
-		return
-	}
 	past := r.FormValue("past") == "1"
 
 	switch r.Method + " " + r.URL.Path {
 	case "GET /~/":
-		log.Printf("ui %s: page %s", user, cal)
-		s.uiPage(w, r, user, cal, past)
+		log.Printf("ui %s: page", user)
+		s.uiPage(w, r, user, past)
 	case "GET /~/events":
-		s.uiPoll(w, r, user, cal, past)
+		s.uiPoll(w, r, user, past)
 	case "POST /~/events":
-		log.Printf("ui %s: add event to %s", user, cal)
-		s.uiAddEvent(w, r, user, cal, past)
+		log.Printf("ui %s: add event", user)
+		s.uiAddEvent(w, r, user, past)
 	case "DELETE /~/events":
-		log.Printf("ui %s: delete event %s/%s", user, cal, r.FormValue("name"))
-		s.uiDeleteEvent(w, r, user, cal, past)
-	case "POST /~/calendars":
-		log.Printf("ui %s: add calendar %s", user, r.FormValue("name"))
-		s.uiAddCalendar(w, r, user)
-	case "DELETE /~/calendars":
-		log.Printf("ui %s: delete calendar %s", user, cal)
-		s.uiDeleteCalendar(w, r, user, cal)
+		log.Printf("ui %s: delete event %s", user, r.FormValue("name"))
+		s.uiDeleteEvent(w, r, user, past)
 	default:
 		http.NotFound(w, r)
 	}
 }
+
+// The UI shows only the default calendar; other calendars made by CalDAV
+// clients are left alone.
+const uiCal = "calendar"
 
 // uiError logs the error under its code and shows both in the page's error
 // box, whatever element made the request.
@@ -95,56 +85,32 @@ func uiError(w http.ResponseWriter, status int, code string, err error) {
 
 const clearError = `<div id="error" role="alert" hx-swap-oob="true"></div>`
 
-func eventsURL(cal string, past bool) string {
-	q := url.Values{"cal": {cal}}
+// eventsURL keeps the past toggle on every request the event list makes.
+func eventsURL(past bool, q url.Values) string {
 	if past {
 		q.Set("past", "1")
+	}
+	if len(q) == 0 {
+		return "/~/events"
 	}
 	return "/~/events?" + q.Encode()
 }
 
-func pageURL(cal string, past bool) string {
-	q := url.Values{"cal": {cal}}
-	if past {
-		q.Set("past", "1")
-	}
-	return "/~/?" + q.Encode()
-}
-
-// ── pages ────────────────────────────────────────────────────────────────────
-
-type calendarLink struct {
-	Name, URL string
-	Current   bool
-}
+// ── page ─────────────────────────────────────────────────────────────────────
 
 type pageView struct {
-	User, Cal, Today       string
-	Calendars              []calendarLink
-	Missing, Past          bool
-	TogglePastURL, CalsURL string
-	Events                 eventsView
+	User, Today string
+	Past        bool
+	Events      eventsView
 }
 
-func (s *server) uiPage(w http.ResponseWriter, r *http.Request, user, cal string, past bool) {
-	cals, err := s.children(r.Context(), resource{kind: kHome, user: user}, false)
-	if err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-PAGE-CALS", err)
-		return
-	}
-	v := pageView{User: user, Cal: cal, Past: past, Today: time.Now().Format("2006-01-02"),
-		TogglePastURL: pageURL(cal, !past), CalsURL: "/~/calendars?" + url.Values{"cal": {cal}}.Encode()}
-	for _, c := range cals {
-		v.Calendars = append(v.Calendars, calendarLink{Name: c.segs[1], URL: pageURL(c.segs[1], false), Current: c.segs[1] == cal})
-	}
-	events, found, err := s.loadEvents(r.Context(), user, cal, past)
+func (s *server) uiPage(w http.ResponseWriter, r *http.Request, user string, past bool) {
+	events, err := s.loadEvents(r.Context(), user, past)
 	if err != nil {
 		uiError(w, http.StatusInternalServerError, "E-UI-DB-PAGE-EVENTS", err)
 		return
 	}
-	v.Missing = !found
-	v.Events = events
-	render(w, "page", v)
+	render(w, "page", pageView{User: user, Today: time.Now().Format("2006-01-02"), Past: past, Events: events})
 }
 
 func render(w http.ResponseWriter, name string, data any, extra ...string) {
@@ -161,34 +127,27 @@ func render(w http.ResponseWriter, name string, data any, extra ...string) {
 }
 
 // uiPoll re-renders the event list only when the calendar's ctag moved.
-func (s *server) uiPoll(w http.ResponseWriter, r *http.Request, user, cal string, past bool) {
-	res := resource{kind: kCal, user: user, segs: []string{user, cal}}
+func (s *server) uiPoll(w http.ResponseWriter, r *http.Request, user string, past bool) {
+	res := resource{kind: kCal, user: user, segs: []string{user, uiCal}}
 	found, err := s.load(r.Context(), &res, false)
 	if err != nil {
 		uiError(w, http.StatusInternalServerError, "E-UI-DB-POLL", err)
 		return
 	}
-	if !found {
-		w.Header().Set("HX-Refresh", "true")
-		return
-	}
+	// A missing calendar has ctag 0 and renders as an empty list, like loadEvents.
 	if r.FormValue("ctag") == strconv.FormatInt(res.ctag, 10) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	log.Printf("ui %s: %s changed, refreshing", user, cal)
+	log.Printf("ui %s: calendar changed (found=%v), refreshing", user, found)
 	// No clearError here: a phone syncing must not wipe an error the user is reading.
-	s.renderEvents(w, r.Context(), user, cal, past, "E-UI-DB-POLL-EVENTS")
+	s.renderEvents(w, r.Context(), user, past, "E-UI-DB-POLL-EVENTS")
 }
 
-func (s *server) renderEvents(w http.ResponseWriter, ctx context.Context, user, cal string, past bool, code string, extra ...string) {
-	events, found, err := s.loadEvents(ctx, user, cal, past)
+func (s *server) renderEvents(w http.ResponseWriter, ctx context.Context, user string, past bool, code string, extra ...string) {
+	events, err := s.loadEvents(ctx, user, past)
 	if err != nil {
 		uiError(w, http.StatusInternalServerError, code, err)
-		return
-	}
-	if !found {
-		w.Header().Set("HX-Refresh", "true")
 		return
 	}
 	render(w, "events", events, extra...)
@@ -196,36 +155,58 @@ func (s *server) renderEvents(w http.ResponseWriter, ctx context.Context, user, 
 
 // ── events ───────────────────────────────────────────────────────────────────
 
+// Rows are listed by group, then start: dated events, series that already
+// started (we don't expand recurrences, so their first date says nothing
+// about the next one), then events without a date.
+const (
+	groupDated = iota
+	groupRepeating
+	groupUndated
+)
+
 type eventRow struct {
-	start                    time.Time
-	When, Summary, DeleteURL string
-	Past                     bool
+	group                            int
+	start                            time.Time
+	day                              string // start's date in the event's own zone, which is what the list shows
+	Time, Detail, Summary, DeleteURL string
+	Past                             bool
+}
+
+type eventDay struct {
+	Label, Date string
+	Today       bool
+	Rows        []eventRow
 }
 
 type eventsView struct {
 	URL, PollURL string
-	Rows         []eventRow
+	Days         []eventDay
 	Hidden       int
 	Past         bool
 }
 
-// loadEvents reads a calendar's ctag and objects and turns them into rows
-// sorted by start time. Past events are counted but left out unless asked for.
-func (s *server) loadEvents(ctx context.Context, user, cal string, past bool) (eventsView, bool, error) {
-	res := resource{kind: kCal, user: user, segs: []string{user, cal}}
+// loadEvents reads the UI calendar's ctag and objects and groups them into
+// days. Past events are counted but left out unless asked for. A missing
+// calendar (deleted over CalDAV a moment ago) is just an empty list.
+func (s *server) loadEvents(ctx context.Context, user string, past bool) (eventsView, error) {
+	v := eventsView{URL: eventsURL(past, url.Values{}), Past: past}
+	res := resource{kind: kCal, user: user, segs: []string{user, uiCal}}
 	// ctag first: if an edit lands between the two reads, the list is newer
 	// than the ctag and the next poll simply renders it again.
 	found, err := s.load(ctx, &res, false)
-	if err != nil || !found {
-		return eventsView{}, found, err
+	if err != nil {
+		return v, err
+	}
+	v.PollURL = eventsURL(past, url.Values{"ctag": {strconv.FormatInt(res.ctag, 10)}})
+	if !found {
+		return v, nil
 	}
 	objs, err := s.children(ctx, res, true)
 	if err != nil {
-		return eventsView{}, true, err
+		return v, err
 	}
-	v := eventsView{URL: eventsURL(cal, past), Past: past}
-	v.PollURL = v.URL + "&ctag=" + strconv.FormatInt(res.ctag, 10)
 	now := time.Now()
+	var rows []eventRow
 	for _, o := range objs {
 		ev := parseEvent(o.obj.data)
 		// Recurrences aren't expanded, so a series is never treated as over.
@@ -238,24 +219,73 @@ func (s *server) loadEvents(ctx context.Context, user, cal string, past bool) (e
 		if summary == "" {
 			summary = "(no title)"
 		}
-		when := ev.when()
-		if ev.repeats {
-			when += ", repeats"
+		clock, detail := ev.times()
+		group := groupDated
+		switch {
+		case ev.start.IsZero():
+			group = groupUndated
+		case ev.repeats && ev.start.Before(now):
+			group = groupRepeating
+			detail = "since " + ev.start.Format("2 Jan 2006")
+			if ev.zone != "" {
+				detail += " · " + ev.zone
+			}
+		case ev.repeats:
+			detail = strings.TrimPrefix(detail+" · repeats", " · ")
 		}
-		v.Rows = append(v.Rows, eventRow{start: ev.start, When: when, Summary: summary, Past: isPast,
-			DeleteURL: v.URL + "&" + url.Values{"name": {o.segs[2]}}.Encode()})
+		rows = append(rows, eventRow{group: group, start: ev.start, day: ev.start.Format("2006-01-02"),
+			Time: clock, Detail: detail, Summary: summary, Past: isPast,
+			DeleteURL: eventsURL(past, url.Values{"name": {o.segs[2]}})})
 	}
-	sort.SliceStable(v.Rows, func(i, j int) bool {
-		a, b := v.Rows[i].start, v.Rows[j].start
-		if a.IsZero() || b.IsZero() {
-			return !a.IsZero() && b.IsZero()
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if a.group != b.group {
+			return a.group < b.group
 		}
-		return a.Before(b)
+		if a.group == groupDated && a.day != b.day {
+			return a.day < b.day
+		}
+		return a.start.Before(b.start)
 	})
-	return v, true, nil
+
+	prev := eventRow{group: -1}
+	for _, row := range rows {
+		if row.group != prev.group || (row.group == groupDated && row.day != prev.day) {
+			day := eventDay{Label: "Repeating"}
+			if row.group != groupRepeating {
+				day.Label, day.Date, day.Today = dayLabel(row.start, now)
+			}
+			v.Days = append(v.Days, day)
+		}
+		v.Days[len(v.Days)-1].Rows = append(v.Days[len(v.Days)-1].Rows, row)
+		prev = row
+	}
+	return v, nil
 }
 
-func (s *server) uiAddEvent(w http.ResponseWriter, r *http.Request, user, cal string, past bool) {
+// dayLabel names the date an event starts on (in the event's own zone, as
+// shown), relative to today in the server's zone where that reads better.
+func dayLabel(start, now time.Time) (label, date string, today bool) {
+	if start.IsZero() {
+		return "No date", "", false
+	}
+	date = start.Format("Mon 2 Jan")
+	if start.Year() != now.Year() {
+		date += start.Format(" 2006")
+	}
+	day := func(t time.Time) string { return t.Format("2006-01-02") }
+	switch day(start) {
+	case day(now):
+		return "Today", date, true
+	case day(now.AddDate(0, 0, 1)):
+		return "Tomorrow", date, false
+	case day(now.AddDate(0, 0, -1)):
+		return "Yesterday", date, false
+	}
+	return start.Format("Monday"), date, false
+}
+
+func (s *server) uiAddEvent(w http.ResponseWriter, r *http.Request, user string, past bool) {
 	summary := strings.TrimSpace(r.FormValue("summary"))
 	if summary == "" {
 		uiError(w, http.StatusUnprocessableEntity, "E-UI-EVENT-SUMMARY", errors.New("the event needs a title"))
@@ -302,15 +332,15 @@ func (s *server) uiAddEvent(w http.ResponseWriter, r *http.Request, user, cal st
 		foldLine("SUMMARY:"+escapeText(summary)) +
 		"END:VEVENT\r\nEND:VCALENDAR\r\n"
 
-	if status, code, err := s.insertEvent(r.Context(), user, cal, uid+".ics", []byte(data)); err != nil {
+	if status, code, err := s.insertEvent(r.Context(), user, uid+".ics", []byte(data)); err != nil {
 		uiError(w, status, code, err)
 		return
 	}
-	s.renderEvents(w, r.Context(), user, cal, past, "E-UI-DB-ADD-EVENTS", clearError)
+	s.renderEvents(w, r.Context(), user, past, "E-UI-DB-ADD-EVENTS", clearError)
 }
 
 // insertEvent holds the write lock only for the write, not for re-rendering.
-func (s *server) insertEvent(ctx context.Context, user, cal, name string, data []byte) (int, string, error) {
+func (s *server) insertEvent(ctx context.Context, user, name string, data []byte) (int, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -318,18 +348,19 @@ func (s *server) insertEvent(ctx context.Context, user, cal, name string, data [
 		return http.StatusInternalServerError, "E-UI-DB-ADD-BEGIN", err
 	}
 	defer tx.Rollback()
+	// Only missing if deleted over CalDAV since this request started.
 	var ctag int64
-	err = tx.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE user = ? AND name = ?`, user, cal).Scan(&ctag)
+	err = tx.QueryRowContext(ctx, `SELECT ctag FROM calendars WHERE user = ? AND name = ?`, user, uiCal).Scan(&ctag)
 	if errors.Is(err, sql.ErrNoRows) {
-		return http.StatusNotFound, "E-UI-CAL-MISSING", fmt.Errorf("calendar %s does not exist", cal)
+		return http.StatusNotFound, "E-UI-CAL-MISSING", errors.New("the calendar was just deleted, reload the page")
 	} else if err != nil {
 		return http.StatusInternalServerError, "E-UI-DB-ADD-CAL", err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO objects (user, cal, name, etag, modified, data) VALUES (?, ?, ?, ?, ?, ?)`,
-		user, cal, name, etagOf(data), time.Now().Unix(), data); err != nil {
+		user, uiCal, name, etagOf(data), time.Now().Unix(), data); err != nil {
 		return http.StatusInternalServerError, "E-UI-DB-ADD-WRITE", err
 	}
-	if err := bumpCtag(ctx, tx, user, cal); err != nil {
+	if err := bumpCtag(ctx, tx, user, uiCal); err != nil {
 		return http.StatusInternalServerError, "E-UI-DB-ADD-CTAG", err
 	}
 	if err := tx.Commit(); err != nil {
@@ -338,20 +369,20 @@ func (s *server) insertEvent(ctx context.Context, user, cal, name string, data [
 	return 0, "", nil
 }
 
-func (s *server) uiDeleteEvent(w http.ResponseWriter, r *http.Request, user, cal string, past bool) {
+func (s *server) uiDeleteEvent(w http.ResponseWriter, r *http.Request, user string, past bool) {
 	name := r.FormValue("name")
 	if !validName.MatchString(name) || !strings.HasSuffix(name, ".ics") {
 		uiError(w, http.StatusBadRequest, "E-UI-BAD-EVENT", fmt.Errorf("invalid event name %q", name))
 		return
 	}
-	if code, err := s.deleteEvent(r.Context(), user, cal, name); err != nil {
+	if code, err := s.deleteEvent(r.Context(), user, name); err != nil {
 		uiError(w, http.StatusInternalServerError, code, err)
 		return
 	}
-	s.renderEvents(w, r.Context(), user, cal, past, "E-UI-DB-DEL-EVENTS", clearError)
+	s.renderEvents(w, r.Context(), user, past, "E-UI-DB-DEL-EVENTS", clearError)
 }
 
-func (s *server) deleteEvent(ctx context.Context, user, cal, name string) (string, error) {
+func (s *server) deleteEvent(ctx context.Context, user, name string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -359,13 +390,13 @@ func (s *server) deleteEvent(ctx context.Context, user, cal, name string) (strin
 		return "E-UI-DB-DEL-BEGIN", err
 	}
 	defer tx.Rollback()
-	deleted, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE user = ? AND cal = ? AND name = ?`, user, cal, name)
+	deleted, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE user = ? AND cal = ? AND name = ?`, user, uiCal, name)
 	if err != nil {
 		return "E-UI-DB-DEL-WRITE", err
 	}
 	// Already gone (deleted elsewhere) is fine: the re-rendered list shows that.
 	if n, _ := deleted.RowsAffected(); n > 0 {
-		if err := bumpCtag(ctx, tx, user, cal); err != nil {
+		if err := bumpCtag(ctx, tx, user, uiCal); err != nil {
 			return "E-UI-DB-DEL-CTAG", err
 		}
 	}
@@ -373,57 +404,6 @@ func (s *server) deleteEvent(ctx context.Context, user, cal, name string) (strin
 		return "E-UI-DB-DEL-COMMIT", err
 	}
 	return "", nil
-}
-
-// ── calendars ────────────────────────────────────────────────────────────────
-
-func (s *server) uiAddCalendar(w http.ResponseWriter, r *http.Request, user string) {
-	name := strings.TrimSpace(r.FormValue("name"))
-	if !validName.MatchString(name) {
-		uiError(w, http.StatusUnprocessableEntity, "E-UI-CAL-NAME", errors.New("calendar names may only use letters, digits and . _ @ + -"))
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	added, err := s.db.ExecContext(r.Context(), `INSERT INTO calendars (user, name, ctag) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-		user, name, time.Now().UnixNano())
-	if err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-MKCAL", err)
-		return
-	}
-	if n, _ := added.RowsAffected(); n == 0 {
-		uiError(w, http.StatusUnprocessableEntity, "E-UI-CAL-EXISTS", fmt.Errorf("calendar %s already exists", name))
-		return
-	}
-	w.Header().Set("HX-Redirect", pageURL(name, false))
-}
-
-func (s *server) uiDeleteCalendar(w http.ResponseWriter, r *http.Request, user, cal string) {
-	ctx := r.Context()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-RMCAL-BEGIN", err)
-		return
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE user = ? AND cal = ?`, user, cal); err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-RMCAL-OBJECTS", err)
-		return
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM calendars WHERE user = ? AND name = ?`, user, cal); err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-RMCAL-WRITE", err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		uiError(w, http.StatusInternalServerError, "E-UI-DB-RMCAL-COMMIT", err)
-		return
-	}
-	if cal == "calendar" {
-		s.homes.Delete(user)
-	}
-	w.Header().Set("HX-Redirect", "/~/")
 }
 
 // ── iCalendar ────────────────────────────────────────────────────────────────
@@ -547,32 +527,38 @@ func (ev eventInfo) ends() time.Time {
 	return ev.start
 }
 
-// when formats the event's time as written in the event, labelled with its
-// zone, since the server does not know the viewer's time zone.
-func (ev eventInfo) when() string {
+// times formats the event's time of day, and a detail line for what doesn't
+// fit there: the end of a multi-day event and the zone. Times are shown as
+// written in the event, since the server does not know the viewer's zone.
+func (ev eventInfo) times() (clock, detail string) {
 	if ev.start.IsZero() {
-		return ""
+		return "", ""
+	}
+	until := func(t time.Time, layout string) string {
+		if t.Year() != ev.start.Year() {
+			layout = strings.Replace(layout, "Jan", "Jan 2006", 1)
+		}
+		return "until " + t.Format(layout)
 	}
 	if ev.allDay {
-		s := ev.start.Format("Mon 2 Jan 2006")
 		if last := ev.ends().AddDate(0, 0, -1); last.After(ev.start) {
-			s += " – " + last.Format("Mon 2 Jan 2006")
+			return "All day", until(last, "Mon 2 Jan")
 		}
-		return s
+		return "All day", ""
 	}
-	s := ev.start.Format("Mon 2 Jan 2006, 15:04")
+	clock = ev.start.Format("15:04")
 	if !ev.end.IsZero() {
 		end := ev.end.In(ev.start.Location())
 		if end.Format("20060102") == ev.start.Format("20060102") {
-			s += "–" + end.Format("15:04")
+			clock += "–" + end.Format("15:04")
 		} else {
-			s += " – " + end.Format("Mon 2 Jan, 15:04")
+			detail = until(end, "Mon 2 Jan, 15:04")
 		}
 	}
 	if ev.zone != "" {
-		s += " " + ev.zone
+		detail = strings.TrimPrefix(detail+" · "+ev.zone, " · ")
 	}
-	return s
+	return clock, detail
 }
 
 var (
@@ -609,65 +595,81 @@ var uiTemplates = template.Must(template.New("").Parse(`
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Cal}} · caldav</title>
+<title>Calendar</title>
 <script src="` + htmxPath + `"></script>
 <style>
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.4; }
-body { max-width: 56rem; margin: 0 auto; padding: 1rem; }
-header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #8884; }
-header h1 { font-size: 1.2rem; margin: .5rem 0; }
-.layout { display: grid; grid-template-columns: 12rem 1fr; gap: 2rem; }
-@media (max-width: 40rem) { .layout { grid-template-columns: 1fr; } }
-ul { list-style: none; padding: 0; }
-nav li { padding: .2rem 0; }
-nav a[aria-current] { font-weight: bold; }
-form { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
-form input[name=name], form input[name=summary] { flex: 1; min-width: 8rem; }
-#events li { display: flex; gap: 1rem; align-items: baseline; padding: .4rem 0; border-bottom: 1px solid #8882; }
-#events time { flex: 0 0 15rem; font-variant-numeric: tabular-nums; opacity: .75; }
-#events span { flex: 1; overflow-wrap: anywhere; }
-#events li.past { opacity: .55; }
-.muted { opacity: .7; }
-#error:not(:empty) { margin: 1rem 0; padding: .5rem 1rem; border: 1px solid #d33; border-radius: 4px; color: #d33; }
+:root {
+  --bg: #f6f6f4; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0;
+  --accent: #2f6fdf; --accent-text: #fff; --accent-soft: #e8effc; --danger: #c62f2f; --danger-soft: #fbeaea;
+  color-scheme: light; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161618; --card: #1f1f22; --text: #ececee; --muted: #9a9aa0; --line: #2f2f33;
+    --accent: #6c9cff; --accent-text: #0b1530; --accent-soft: #1e2a44; --danger: #ff7b7b; --danger-soft: #3a1f1f;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); }
+.wrap { max-width: 40rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; margin-bottom: 1.25rem; }
+h1 { font-size: 1.6rem; margin: 0; letter-spacing: -.01em; }
+.user { color: var(--muted); font-size: .9rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem; }
+form.add { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .75rem; margin-bottom: 2rem; }
+form.add .title { grid-column: 1 / -1; }
+label { display: grid; gap: .25rem; font-size: .8rem; font-weight: 600; color: var(--muted); }
+input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: .5rem .6rem; width: 100%; min-width: 0; }
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.actions { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.hint { color: var(--muted); font-size: .8rem; }
+button.primary { font: inherit; font-weight: 600; background: var(--accent); color: var(--accent-text); border: 0; border-radius: 8px; padding: .55rem 1.1rem; cursor: pointer; }
+button.primary:hover { filter: brightness(1.08); }
+@media (max-width: 30rem) { form.add { grid-template-columns: 1fr 1fr; } form.add .date { grid-column: 1 / -1; } }
+#error:not(:empty) { margin-bottom: 1rem; padding: .7rem 1rem; border-radius: 10px; background: var(--danger-soft); color: var(--danger); }
 #error p { margin: 0; }
+.day { margin-bottom: 1.5rem; }
+.day h2 { display: flex; gap: .5rem; align-items: baseline; font-size: .95rem; margin: 0 0 .5rem; }
+.day h2 span { color: var(--muted); font-weight: 400; }
+.day.today h2 { color: var(--accent); }
+.day ul { list-style: none; margin: 0; padding: 0; }
+.event { display: grid; grid-template-columns: 7.5rem 1fr auto; gap: .75rem; align-items: start; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .6rem .5rem .6rem .9rem; margin-bottom: .4rem; }
+.event.past { opacity: .55; }
+.event .time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: .9rem; padding-top: .05rem; }
+.event .summary { font-weight: 500; overflow-wrap: anywhere; }
+.event .detail { color: var(--muted); font-size: .8rem; }
+.event button { font: inherit; line-height: 1; background: none; border: 0; border-radius: 6px; color: var(--muted); padding: .3rem .45rem; cursor: pointer; }
+.event button:hover, .event button:focus-visible { background: var(--danger-soft); color: var(--danger); }
+@media (max-width: 30rem) { .event { grid-template-columns: 1fr auto; } .event .time { grid-column: 1; } .event .body { grid-row: 2; } .event button { grid-row: 1 / 3; grid-column: 2; } }
+.empty { color: var(--muted); text-align: center; padding: 2rem 1rem; }
+.footer { display: flex; justify-content: space-between; gap: 1rem; color: var(--muted); font-size: .85rem; }
+a { color: var(--accent); }
 </style>
 </head>
 <body>
-<header><h1>caldav</h1><span>{{.User}}</span></header>
+<div class="wrap">
+<header><h1>Calendar</h1><span class="user">{{.User}}</span></header>
 <div id="error" role="alert"></div>
-<div class="layout">
-<nav>
-<h2>Calendars</h2>
-<ul>{{range .Calendars}}<li><a href="{{.URL}}"{{if .Current}} aria-current="page"{{end}}>{{.Name}}</a></li>{{end}}</ul>
-<form hx-post="/~/calendars">
-<input name="name" placeholder="New calendar" required aria-label="New calendar name">
-<button>Add</button>
-</form>
-</nav>
-<main>
-{{if .Missing}}<p>Calendar <strong>{{.Cal}}</strong> does not exist.</p>{{else}}
-<h2>{{.Cal}}</h2>
-<form hx-post="{{.Events.URL}}" hx-target="#events" hx-swap="outerHTML"
+<form class="add card" autocomplete="off" hx-post="{{.Events.URL}}" hx-target="#events" hx-swap="outerHTML"
       hx-on:htmx:after:request="event.detail.ctx.response?.status < 400 && this.reset()">
-<input name="summary" placeholder="Title" required aria-label="Title">
-<input name="date" type="date" required value="{{.Today}}" aria-label="Date">
-<input name="start" type="time" aria-label="Start time">
-<input name="end" type="time" aria-label="End time">
-<button>Add event</button>
+<label class="title">Title<input name="summary" required placeholder="What's happening?"></label>
+<label class="date">Date<input name="date" type="date" required value="{{.Today}}"></label>
+<label>Start<input name="start" type="time"></label>
+<label>End<input name="end" type="time"></label>
+<div class="actions"><span class="hint">Leave start empty for an all-day event.</span><button class="primary">Add event</button></div>
 </form>
 {{template "events" .Events}}
-<p><a href="{{.TogglePastURL}}">{{if .Past}}Hide past events{{else}}Show past events{{end}}</a></p>
-{{if ne .Cal "calendar"}}<p><button hx-delete="{{.CalsURL}}" hx-confirm="Delete calendar {{.Cal}} and all its events?">Delete calendar</button></p>{{end}}
-{{end}}
-</main>
 </div>
 </body>
 </html>
 {{end}}
 
 {{define "events"}}<section id="events" hx-get="{{.PollURL}}" hx-trigger="every 10s" hx-swap="outerHTML">
-{{if .Rows}}<ul>{{range .Rows}}<li{{if .Past}} class="past"{{end}}><time>{{.When}}</time><span>{{.Summary}}</span><button hx-delete="{{.DeleteURL}}" hx-target="#events" hx-swap="outerHTML" hx-confirm="Delete this event?" title="Delete event">✕</button></li>{{end}}</ul>
-{{else}}<p class="muted">{{if .Past}}No events.{{else}}No upcoming events.{{end}}</p>{{end}}
-{{if .Hidden}}<p class="muted">{{.Hidden}} past events hidden.</p>{{end}}
+{{range .Days}}<div class="day{{if .Today}} today{{end}}">
+<h2>{{.Label}}{{if .Date}} <span>{{.Date}}</span>{{end}}</h2>
+<ul>{{range .Rows}}<li class="event{{if .Past}} past{{end}}"><span class="time">{{.Time}}</span><div class="body"><div class="summary">{{.Summary}}</div>{{if .Detail}}<div class="detail">{{.Detail}}</div>{{end}}</div><button hx-delete="{{.DeleteURL}}" hx-target="#events" hx-swap="outerHTML" hx-confirm="Delete “{{.Summary}}”?" aria-label="Delete {{.Summary}}">✕</button></li>{{end}}</ul>
+</div>{{else}}<p class="empty">{{if .Past}}No events yet.{{else}}Nothing coming up.{{end}}</p>{{end}}
+<div class="footer"><span>{{if .Hidden}}{{.Hidden}} past events hidden{{end}}</span><a href="/~/{{if not .Past}}?past=1{{end}}">{{if .Past}}Hide past events{{else}}Show past events{{end}}</a></div>
 </section>{{end}}
 `))

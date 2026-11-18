@@ -75,7 +75,7 @@ func BenchmarkHotPaths(b *testing.B) {
 			b.Fatal(err)
 		}
 		for b.Loop() {
-			if code := call("GET", fmt.Sprintf("/~/events?cal=calendar&ctag=%d", ctag), ""); code != http.StatusNoContent {
+			if code := call("GET", fmt.Sprintf("/~/events?ctag=%d", ctag), ""); code != http.StatusNoContent {
 				b.Fatalf("status %d", code)
 			}
 		}

@@ -7,7 +7,8 @@
 - **`flake.nix` `vendorHash`** must be updated whenever `go.sum` changes: set it to a fake hash, run `nix build`, copy the `got:` hash.
 - **Updating htmx:** replace `htmx-4.0.1.min.js` with `dist/htmx.min.js` from the npm package and rename the file, the `go:embed` line and `htmxPath` in `ui.go` together. The versioned name is what makes the year-long immutable cache header safe.
 - **htmx 4 differs from 2:** it swaps 4xx/5xx responses (2 didn't), skips only 204/304, and `hx-on` events are colon-separated (`hx-on:htmx:after:request`). `uiError` relies on the 4xx swap plus `HX-Retarget`.
-- **The default calendar comes back.** Deleting `calendar` (UI or CalDAV) only lasts until the user's next request, which recreates it; that's why the UI hides its delete button.
+- **htmx runs `hx-confirm="js:…"` as script**, after html/template's escaping is undone. Never let event data start an `hx-confirm` value; ours begins with fixed text ("Delete “…”?").
+- **The default calendar comes back.** Deleting `calendar` over CalDAV only lasts until the user's next request, which recreates it (empty). The UI relies on it always existing.
 - **The UI uses the server's time zone** for the form's default date, for floating times and for deciding what is past. Run the server in the users' zone (`TZ=…`) if that matters.
 - **Trying the UI locally:** the server needs `X-Remote-User`, which browsers don't send. Put any reverse proxy in front that sets it (a 15-line `httputil.ReverseProxy` does).
 - Dev shell: `go build` with VCS stamping fails outside the repo (e.g. scratch dirs) — use `-buildvcs=false` there.
