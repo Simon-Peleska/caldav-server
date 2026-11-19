@@ -45,7 +45,11 @@ func (s *server) ui(w http.ResponseWriter, r *http.Request, user string) {
 		return
 	}
 	if err := crossOrigin.Check(r); err != nil {
-		uiError(w, http.StatusForbidden, "E-UI-CROSS-ORIGIN", err)
+		if strings.HasPrefix(r.URL.Path, "/~/api/") {
+			apiError(w, http.StatusForbidden, "E-UI-CROSS-ORIGIN", err)
+		} else {
+			uiError(w, http.StatusForbidden, "E-UI-CROSS-ORIGIN", err)
+		}
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
@@ -63,6 +67,28 @@ func (s *server) ui(w http.ResponseWriter, r *http.Request, user string) {
 	case "DELETE /~/events":
 		log.Printf("ui %s: delete event %s", user, r.FormValue("name"))
 		s.uiDeleteEvent(w, r, user, past)
+	case "GET /~/manifest.webmanifest":
+		serveStatic(w, "application/manifest+json", "no-cache", []byte(manifestJSON))
+	case "GET /~/sw.js":
+		serveStatic(w, "text/javascript; charset=utf-8", "no-cache", []byte(serviceWorkerJS))
+	case "GET /~/icon.png":
+		serveStatic(w, "image/png", "public, max-age=86400", iconPNG)
+	case "GET /~/push/devices":
+		s.renderDevices(w, r.Context(), user)
+	case "POST /~/push/subscribe":
+		s.pushSubscribe(w, r, user)
+	case "POST /~/push/test":
+		log.Printf("ui %s: test notification %s", user, r.FormValue("id"))
+		s.pushTest(w, r, user)
+	case "DELETE /~/push/devices":
+		log.Printf("ui %s: remove device %s", user, r.FormValue("id"))
+		s.pushRemove(w, r, user)
+	case "POST /~/push/ack":
+		s.pushAck(w, r, user)
+	case "POST /~/push/log":
+		pushLog(w, r, user)
+	case "POST /~/api/notify":
+		s.apiNotify(w, r, user)
 	default:
 		http.NotFound(w, r)
 	}
@@ -99,9 +125,10 @@ func eventsURL(past bool, q url.Values) string {
 // ── page ─────────────────────────────────────────────────────────────────────
 
 type pageView struct {
-	User, Today string
-	Past        bool
-	Events      eventsView
+	User, Today, VAPIDKey string
+	Past                  bool
+	Events                eventsView
+	Devices               []deviceView
 }
 
 func (s *server) uiPage(w http.ResponseWriter, r *http.Request, user string, past bool) {
@@ -110,7 +137,13 @@ func (s *server) uiPage(w http.ResponseWriter, r *http.Request, user string, pas
 		uiError(w, http.StatusInternalServerError, "E-UI-DB-PAGE-EVENTS", err)
 		return
 	}
-	render(w, "page", pageView{User: user, Today: time.Now().Format("2006-01-02"), Past: past, Events: events})
+	devices, err := s.loadDevices(r.Context(), user)
+	if err != nil {
+		uiError(w, http.StatusInternalServerError, "E-UI-DB-PAGE-DEVICES", err)
+		return
+	}
+	render(w, "page", pageView{User: user, Today: time.Now().Format("2006-01-02"), VAPIDKey: s.vapidPublic,
+		Past: past, Events: events, Devices: devices})
 }
 
 func render(w http.ResponseWriter, name string, data any, extra ...string) {
@@ -414,7 +447,10 @@ type eventInfo struct {
 	allDay     bool
 	zone       string // "" for floating times, "UTC", or the TZID
 	repeats    bool
+	triggers   []trigger // of the event's VALARMs
 }
+
+type trigger struct{ value, params string }
 
 // parseEvent reads the summary and times of the first VEVENT or VTODO. It is
 // only meant for display; anything it does not understand is left empty.
@@ -440,6 +476,10 @@ func parseEvent(data []byte) eventInfo {
 					break
 				}
 			}
+			continue
+		}
+		if name == "TRIGGER" && len(components) >= 2 && components[len(components)-1] == "VALARM" {
+			ev.triggers = append(ev.triggers, trigger{value, params})
 			continue
 		}
 		if len(components) == 0 || (components[len(components)-1] != "VEVENT" && components[len(components)-1] != "VTODO") {
@@ -596,6 +636,12 @@ var uiTemplates = template.Must(template.New("").Parse(`
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Calendar</title>
+<link rel="manifest" href="/~/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/~/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Calendar">
+<meta name="theme-color" content="#2f6fdf">
 <script src="` + htmxPath + `"></script>
 <style>
 :root {
@@ -645,6 +691,16 @@ button.primary:hover { filter: brightness(1.08); }
 .empty { color: var(--muted); text-align: center; padding: 2rem 1rem; }
 .footer { display: flex; justify-content: space-between; gap: 1rem; color: var(--muted); font-size: .85rem; }
 a { color: var(--accent); }
+.push { margin-top: 2.5rem; }
+.push h2 { font-size: .95rem; margin: 0 0 .25rem; }
+.push p { margin: 0 0 .75rem; }
+.push ul { list-style: none; margin: 0 0 .75rem; padding: 0; }
+.device { display: grid; grid-template-columns: 1fr auto auto; gap: .5rem; align-items: center; border-top: 1px solid var(--line); padding: .6rem 0; }
+.device .detail { color: var(--muted); font-size: .8rem; overflow-wrap: anywhere; }
+.device.failed .detail { color: var(--danger); }
+button.secondary { font: inherit; font-size: .85rem; background: var(--accent-soft); color: var(--accent); border: 0; border-radius: 8px; padding: .4rem .8rem; cursor: pointer; }
+.device button.remove { font: inherit; line-height: 1; background: none; border: 0; border-radius: 6px; color: var(--muted); padding: .3rem .45rem; cursor: pointer; }
+.device button.remove:hover, .device button.remove:focus-visible { background: var(--danger-soft); color: var(--danger); }
 </style>
 </head>
 <body>
@@ -660,7 +716,118 @@ a { color: var(--accent); }
 <div class="actions"><span class="hint">Leave start empty for an all-day event.</span><button class="primary">Add event</button></div>
 </form>
 {{template "events" .Events}}
+<section class="push card">
+<h2>Notifications</h2>
+<p id="push-state" class="hint">Checking this device…</p>
+<p><button id="push-enable" class="primary" hidden>Turn on for this device</button></p>
+{{template "devices" .Devices}}
+</section>
 </div>
+<script>
+(() => {
+  const key = {{.VAPIDKey}};
+  const state = document.getElementById("push-state");
+  const button = document.getElementById("push-enable");
+  // Codes shown here are logged on the server too, so a reported code can be found there.
+  const report = (code, message) => fetch("/~/push/log", { method: "POST", keepalive: true, body: new URLSearchParams({ code, message }) }).catch(() => {});
+  const show = (code, text) => {
+    state.textContent = (code ? code + " " : "") + text;
+    if (code) report(code, text);
+  };
+  const fail = (code, err) => {
+    console.error(code, err);
+    const message = String((err && err.message) || err);
+    const p = document.createElement("p"), b = document.createElement("strong");
+    b.textContent = code;
+    p.append(b, " " + message);
+    document.getElementById("error").replaceChildren(p);
+    state.textContent = code + " Notifications are not working on this device; see the error above.";
+    report(code, message);
+  };
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    if (ios && !standalone) show("E-PUSH-IOS-HOMESCREEN", "On iPhone and iPad, notifications only work from the home screen: tap Share, then “Add to Home Screen”, and open Calendar from there.");
+    else show("E-PUSH-UNSUPPORTED", "This browser can't receive push notifications.");
+    return;
+  }
+  const keyBytes = Uint8Array.from(atob(key.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+  // Not every browser exposes a subscription's key; a missing one counts as ours.
+  const otherKey = sub => !!sub.options.applicationServerKey && !(sub.options.applicationServerKey.byteLength === keyBytes.length && new Uint8Array(sub.options.applicationServerKey).every((b, i) => b === keyBytes[i]));
+  const registered = navigator.serviceWorker.register("/~/sw.js", { scope: "/~/" });
+  const step = async (code, work) => { try { return await work(); } catch (err) { throw Object.assign(new Error((err && err.message) || String(err)), { code }); } };
+  // Per user: several people may share one browser.
+  const idKey = "push-id:" + {{.User}};
+  const stored = name => { try { return localStorage.getItem(name) || ""; } catch (err) { return ""; } };
+  const store = (name, value) => { try { localStorage.setItem(name, value); } catch (err) {} };
+
+  // Runs on every visit once allowed: it renews subscriptions the browser
+  // dropped (Safari does that) and re-sends the current one to the server.
+  async function connect() {
+    show("", "Connecting this device…");
+    const reg = await step("E-PUSH-SW", () => registered);
+    let sub = await step("E-PUSH-GETSUB", () => reg.pushManager.getSubscription());
+    if (sub && otherKey(sub)) {
+      await step("E-PUSH-UNSUB-KEY", () => sub.unsubscribe());
+      sub = null;
+    }
+    for (let attempt = 0; ; attempt++) {
+      if (!sub) sub = await step("E-PUSH-SUB", () => reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes }));
+      const res = await step("E-PUSH-SAVE-NET", () => fetch("/~/push/subscribe", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription: sub.toJSON(), replaces: stored("push-endpoint") }),
+      }));
+      if (!res.ok) {
+        const text = new DOMParser().parseFromString(await res.text(), "text/html").body.textContent.trim();
+        throw Object.assign(new Error("saving the subscription failed (HTTP " + res.status + "): " + text), { code: "E-PUSH-SAVE-HTTP" });
+      }
+      const saved = await step("E-PUSH-SAVE-JSON", () => res.json());
+      store("push-endpoint", sub.endpoint);
+      store(idKey, saved.id);
+      if (!saved.gone) break;
+      if (attempt > 0) throw Object.assign(new Error("the push service rejects this device's subscription even after renewing it"), { code: "E-PUSH-RENEW" });
+      await step("E-PUSH-UNSUB-GONE", () => sub.unsubscribe());
+      sub = null;
+    }
+    document.getElementById("devices").dispatchEvent(new Event("refresh"));
+    show("", "On for this device. Use “Test” to check that notifications arrive.");
+  }
+
+  // A device removed from the list (here or elsewhere) stays off until turned
+  // on again. A subscription for another server key isn't a removal: the
+  // server lost its database, and the device reconnects.
+  async function start() {
+    const id = stored(idKey);
+    if (id && !document.querySelector('#devices [data-id="' + CSS.escape(id) + '"]')) {
+      const reg = await step("E-PUSH-SW", () => registered);
+      const sub = await step("E-PUSH-GETSUB", () => reg.pushManager.getSubscription());
+      if (!sub || !otherKey(sub)) {
+        button.hidden = false;
+        show("", "Notifications are off for this device.");
+        if (sub) await step("E-PUSH-UNSUB-REMOVED", () => sub.unsubscribe());
+        return;
+      }
+    }
+    await connect();
+  }
+
+  const permission = Notification.permission;
+  button.hidden = permission !== "default";
+  if (permission === "denied") show("E-PUSH-DENIED", "Notifications are blocked for this site. Allow them in the browser's or system's settings, then reload.");
+  else if (permission === "default") show("", "Turn notifications on to get event reminders on this device.");
+  else start().catch(err => fail(err.code || "E-PUSH-START", err));
+
+  button.addEventListener("click", async () => {
+    // iOS only lets a page ask from inside a tap, so ask before awaiting anything else.
+    let answer;
+    try { answer = await Notification.requestPermission(); } catch (err) { return fail("E-PUSH-PERMISSION", err); }
+    button.hidden = answer !== "default";
+    if (answer === "denied") return show("E-PUSH-DENIED", "Notifications were blocked. Allow them in the browser's or system's settings, then reload.");
+    if (answer !== "granted") return show("", "Turn notifications on to get event reminders on this device.");
+    connect().catch(err => fail(err.code || "E-PUSH-CONNECT", err));
+  });
+})();
+</script>
 </body>
 </html>
 {{end}}
@@ -672,4 +839,9 @@ a { color: var(--accent); }
 </div>{{else}}<p class="empty">{{if .Past}}No events yet.{{else}}Nothing coming up.{{end}}</p>{{end}}
 <div class="footer"><span>{{if .Hidden}}{{.Hidden}} past events hidden{{end}}</span><a href="/~/{{if not .Past}}?past=1{{end}}">{{if .Past}}Hide past events{{else}}Show past events{{end}}</a></div>
 </section>{{end}}
+
+{{define "devices"}}<div id="devices" hx-get="/~/push/devices" hx-trigger="refresh" hx-swap="outerHTML">
+{{if .}}<ul>{{range .}}<li class="device{{if .Failed}} failed{{end}}" data-id="{{.ID}}"><div class="body"><div class="summary">{{.Name}}</div><div class="detail">{{.Status}}</div></div><button class="secondary" hx-post="/~/push/test?id={{.ID}}" hx-target="#devices" hx-swap="outerHTML">Test</button><button class="remove" hx-delete="/~/push/devices?id={{.ID}}" hx-target="#devices" hx-swap="outerHTML" hx-confirm="Stop notifications on {{.Name}}?" aria-label="Remove {{.Name}}">✕</button></li>{{end}}</ul>
+{{if gt (len .) 1}}<button class="secondary" hx-post="/~/push/test" hx-target="#devices" hx-swap="outerHTML">Test all devices</button>{{end}}
+{{else}}<p class="hint">No device gets notifications yet.</p>{{end}}</div>{{end}}
 `))

@@ -20,7 +20,11 @@ func newTestServer(t *testing.T, dir string) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(&server{db: db})
+	s, err := newServer(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
 	t.Cleanup(func() {
 		ts.Close()
 		db.Close()

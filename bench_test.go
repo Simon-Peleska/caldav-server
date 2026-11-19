@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // BenchmarkHotPaths measures what sync clients do all day against a
@@ -18,7 +20,10 @@ func BenchmarkHotPaths(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer db.Close()
-	s := &server{db: db}
+	s, err := newServer(db)
+	if err != nil {
+		b.Fatal(err)
+	}
 	call := func(method, path, body string, headers ...string) int {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("X-Remote-User", "alice")
@@ -78,6 +83,14 @@ func BenchmarkHotPaths(b *testing.B) {
 			if code := call("GET", fmt.Sprintf("/~/events?ctag=%d", ctag), ""); code != http.StatusNoContent {
 				b.Fatalf("status %d", code)
 			}
+		}
+	})
+	b.Run("push-alarm-scan", func(b *testing.B) {
+		if _, err := db.Exec(`INSERT INTO push_devices (id, user, endpoint, p256dh, auth, subject, name, created) VALUES ('d', 'alice', 'https://push.invalid/d', x'00', x'00', 'https://x', 'bench', 0)`); err != nil {
+			b.Fatal(err)
+		}
+		for b.Loop() {
+			s.notifyDue(context.Background(), time.Now())
 		}
 	})
 	b.Run("get", func(b *testing.B) {

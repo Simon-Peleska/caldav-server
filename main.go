@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -69,6 +70,12 @@ type server struct {
 	db    *sql.DB
 	mu    sync.Mutex // serialises writes so If-Match checks are not racy
 	homes sync.Map   // users whose default calendar is known to exist
+
+	vapid       *ecdsa.PrivateKey // signs Web Push requests
+	vapidPublic string            // base64url, what browsers subscribe with
+	pushSubject string            // PUSH_SUBJECT; overrides the per-device origin
+	push        *http.Client
+	pushHosts   []string // push services a device may subscribe with; see pushServices
 }
 
 func main() {
@@ -81,9 +88,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("E-DB-OPEN opening database: %v", err)
 	}
+	s, err := newServer(db)
+	if err != nil {
+		log.Fatalf("E-PUSH-KEY loading the push key: %v", err)
+	}
+	go s.pushLoop()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           &server{db: db},
+		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -109,7 +121,7 @@ func openDB(path string) (*sql.DB, error) {
 	// them around instead of letting database/sql close and reopen them.
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + pushSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -177,7 +189,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	isUI := strings.HasPrefix(r.URL.Path, "/~/")
 	if err := s.ensureDefaultCalendar(r.Context(), user); err != nil {
-		if isUI {
+		if strings.HasPrefix(r.URL.Path, "/~/api/") {
+			apiError(w, http.StatusInternalServerError, "E-DB-HOME", err)
+		} else if isUI {
 			uiError(w, http.StatusInternalServerError, "E-DB-HOME", err)
 		} else {
 			storageError(w, "E-DB-HOME", err)

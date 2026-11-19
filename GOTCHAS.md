@@ -11,4 +11,15 @@
 - **The default calendar comes back.** Deleting `calendar` over CalDAV only lasts until the user's next request, which recreates it (empty). The UI relies on it always existing.
 - **The UI uses the server's time zone** for the form's default date, for floating times and for deciding what is past. Run the server in the users' zone (`TZ=…`) if that matters.
 - **Trying the UI locally:** the server needs `X-Remote-User`, which browsers don't send. Put any reverse proxy in front that sets it (a 15-line `httputil.ReverseProxy` does).
+- **iOS Web Push only works from a home-screen app** (iOS 16.4+): open the page in Safari, Share → Add to Home Screen, open it from there, then turn notifications on. In a normal Safari tab `PushManager` doesn't exist; the page says so (`E-PUSH-IOS-HOMESCREEN`).
+- **The service worker must show a notification for every push.** Safari revokes the subscription after a few silent pushes. `sw.js` always calls `showNotification`, even for an unreadable payload.
+- **Notification permission must be asked directly in a tap handler** on iOS; any `await` before `Notification.requestPermission()` loses the user gesture and the prompt never appears.
+- **Basic auth and the manifest:** browsers fetch the manifest without credentials unless the link has `crossorigin="use-credentials"`; without it the proxy answers 401 and the app isn't installable.
+- **Apple rejects VAPID JWTs with a bad `sub`** (403 `BadJwtToken`), e.g. `https://localhost`. The default is the page's own https origin; set `PUSH_SUBJECT=mailto:…` if that isn't public.
+- **Losing the database loses the VAPID key**, and every subscription is bound to it: all devices then have to turn notifications on again (the page does it on its next visit).
+- **Only known push services are accepted** (`pushServices` in `push.go`). A browser using a different push host gets `E-PUSH-SUB-HOST`; add the host there.
+- **One browser gets notifications for one user.** A push subscription belongs to the browser, so if two people use the same browser profile, the last one to open the page owns it, and removing it for one turns it off for both.
+- **Reminders can come twice.** CalDAV clients (iOS Calendar, Thunderbird, …) fire VALARMs themselves, and so does the server. Events without a VALARM ("Alert: None") still notify at their start; there is no per-event opt-out.
+- **Unverified on a real iPhone:** whether the service worker's `/~/push/ack` carries the proxy's basic-auth credentials. If it doesn't, iOS devices stay at "hasn't confirmed it yet" although notifications do show.
+- **Alarms use the server's time zone** for floating times, and all-day events alarm at 09:00. Repeating events only alarm for their first occurrence.
 - Dev shell: `go build` with VCS stamping fails outside the repo (e.g. scratch dirs) — use `-buildvcs=false` there.

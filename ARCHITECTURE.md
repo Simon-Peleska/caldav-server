@@ -14,6 +14,23 @@ Server-rendered `html/template` pages under `/~/` (`~` can't start a user name, 
 - "Past" is decided at render time, and polls only re-render when the ctag changes, so an event that ends while the tab is open stays in the upcoming list until the next change or reload. Good enough for a simple UI.
 - Cost (`bench_test.go`, 2000 events): unchanged poll 0.014 ms; full page 23 ms, mostly reading event rows from Turso, then templating (the day-grouped markup put it up from 17 ms) and ICS parsing. The UI write handlers release `server.mu` before re-rendering, so CalDAV writes don't wait on that.
 
+## Web Push (`push.go`)
+
+Notifications go out over standard Web Push with no extra dependency: VAPID (RFC 8292, an ES256 JWT signed with `crypto/ecdsa`) and aes128gcm payload encryption (RFC 8291, `crypto/ecdh` + `crypto/hkdf` + AES-GCM). The VAPID key is created on first start and kept in the `settings` table, so it lives and dies with the database.
+
+- Devices: `push_devices`, one row per subscription endpoint (id = hash of the endpoint), owned by a user. The page's `connect()` re-registers on every visit, so a renewed or replaced subscription (iOS does this) updates the row; `replaces` lets the page drop its old endpoint. The answer says whether the subscription is already `gone`, and the page then subscribes afresh. The page remembers its device id (per user), so a device removed from the list stays off instead of re-registering on the next visit; a subscription for a different server key is not taken as a removal. Error codes that only happen in the browser (permission, subscribing) are posted to `/~/push/log`, so they appear in the server log too.
+- Endpoints: the server POSTs to whatever URL a device registered, so only https URLs on known push services (`pushServices`) are accepted, redirects are not followed, and only 401/403 response bodies (Apple's reason) are shown.
+- Sending: `sendToUser` sends to all devices in parallel with a 10 s timeout each, so a dead device can't push the answer past the HTTP write timeout. Notifications carry no `tag`, so a second alarm for the same event isn't silently merged into the first.
+- Alarms: `pushLoop` runs `notifyDue` every 30 s. It reads every event in all calendars of users with devices (not only the one the UI shows), computes alarm times from VALARM `TRIGGER`s (relative, `RELATED=END`, absolute) or the start (09:00 for all-day events), and sends those that fell due in the last 10 min. `push_sent` remembers what was sent so a restart doesn't repeat, and is cleaned after 48 h. Recurrences are not expanded.
+- No silent failures, because push is fire-and-forget on the server side and silently dropped on iOS:
+  - Every send stores `sent`, or the error code and message, on the device; the UI lists each device with that status.
+  - 404/410 marks the device `gone` (skipped until it re-subscribes); 401/403 points at `PUSH_SUBJECT`, since Apple rejects bad JWT subjects.
+  - The service worker always shows a notification (Safari revokes subscriptions that don't) and posts back to `/~/push/ack`, so "shown" proves the whole path worked, not just the push service's 201.
+  - Test buttons send to one or all devices and show failures in place.
+  - The page explains why it can't subscribe (iOS not installed to home screen, unsupported browser, permission denied) instead of hiding the button.
+- API: `POST /~/api/notify` sends a message to all of the caller's devices and answers with per-device results. Same auth and same send path as alarms.
+- Cost (`bench_test.go`, 2000 events): one alarm scan is ~9 ms every 30 s, mostly reading and parsing the events, the same as a page render.
+
 ## Storage
 
 `DATA_DIR/caldav.db`, opened through `database/sql` with the `turso.tech/database/tursogo` driver (no CGO; it loads a Rust library via purego).
